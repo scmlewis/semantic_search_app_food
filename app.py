@@ -79,6 +79,13 @@ MEAT_KEYWORDS = [
 
 DAIRY_KEYWORDS = ['cheese', 'milk', 'egg', 'dairy', 'yogurt', 'butter', 'cream', 'whey']
 
+VEGETABLE_KEYWORDS = [
+    'vegetable', 'lettuce', 'tomato', 'carrot', 'broccoli', 'spinach', 
+    'kale', 'potato', 'onion', 'pepper', 'cucumber', 'celery', 'cabbage',
+    'cauliflower', 'zucchini', 'squash', 'eggplant', 'mushroom', 'corn',
+    'peas', 'beans', 'asparagus', 'beet', 'radish', 'turnip'
+]
+
 # ==================== HELPER FUNCTIONS ====================
 
 def normalize_nutrient_name(nutrient):
@@ -370,6 +377,7 @@ with tab1:
                 if results:
                     st.success(f"✅ Found {len(results)} results")
                     st.subheader("📊 Search Results")
+                    st.caption("*All nutrient values shown are per 100g of food")
                     
                     for i, result in enumerate(results):
                         with st.expander(f"**{i+1}. {result['metadata'].get('description', 'Unknown')}**", expanded=(i<3)):
@@ -387,7 +395,7 @@ with tab1:
                             
                             nutrients = result['nutrients']
                             if nutrients:
-                                st.markdown("**Nutrients:**")
+                                st.markdown("**Nutrients (per 100g):**")
                                 nutrient_text = ", ".join([f"{k}: {v}{'kcal' if k == 'calories' else 'g'}" 
                                                           for k, v in nutrients.items()])
                                 st.text(nutrient_text)
@@ -419,6 +427,7 @@ with tab2:
     - ~5,400 foods commonly consumed in the US
     - Filtered for quality (removed baby foods, supplements, incomplete data)
     - 12 key nutrients tracked per food
+    - **All nutrient values are per 100g of food**
     - [Download source](https://fdc.nal.usda.gov/download-datasets.html)
     """)
     
