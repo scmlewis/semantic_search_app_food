@@ -1,274 +1,477 @@
 import streamlit as st
-from sentence_transformers import SentenceTransformer
 import chromadb
+from sentence_transformers import SentenceTransformer
 import re
+import json
+import os
 
-# Page config
-st.set_page_config(page_title="Nutrition Advisor", page_icon="🥗", layout="wide")
+# Initialize ChromaDB client
+client = chromadb.PersistentClient(path="./chromadb_data")
 
-# Title
-st.title("🥗 Nutrition Advisor - Semantic Search")
-st.markdown("Search through nutrition data using natural language queries")
+try:
+    collection = client.get_collection(name="nutrition_foods")
+except:
+    st.error("Collection 'nutrition_foods' not found. Please run the data loading script first.")
+    st.stop()
 
-# Initialize session state
-if 'search_triggered' not in st.session_state:
-    st.session_state.search_triggered = False
-if 'current_query' not in st.session_state:
-    st.session_state.current_query = ""
-if 'current_n_results' not in st.session_state:
-    st.session_state.current_n_results = 10
-if 'last_results' not in st.session_state:
-    st.session_state.last_results = []
+# Load sentence transformer model
+model = SentenceTransformer('all-MiniLM-L6-v2')
 
-# Initialize ChromaDB client and collection
-@st.cache_resource
-def init_chromadb():
-    client = chromadb.PersistentClient(path="./chroma_data")
-    try:
-        collection = client.get_collection("nutrition_data")
-    except:
-        st.error("Collection 'nutrition_data' not found. Please run the data loading script first.")
-        st.stop()
-    return collection
+# Load nutrients data
+if os.path.exists('nutrients_data.json'):
+    with open('nutrients_data.json', 'r') as f:
+        nutrients_data = json.load(f)
+else:
+    st.error("nutrients_data.json not found. Please run the data loading script first.")
+    st.stop()
 
-collection = init_chromadb()
+# ==================== CONFIGURATION ====================
 
-# Initialize embedding model
-@st.cache_resource
-def load_model():
-    return SentenceTransformer('all-MiniLM-L6-v2')
+NUTRIENT_MAPPING = {
+    'protein': 'protein', 'fat': 'fat', 'carbs': 'carbs', 'carbohydrates': 'carbs',
+    'fiber': 'fiber', 'fibre': 'fiber', 'sugar': 'sugar', 'sodium': 'sodium',
+    'salt': 'sodium', 'calcium': 'calcium', 'iron': 'iron', 'cholesterol': 'cholesterol',
+    'calories': 'calories', 'vitamin_a': 'vitamin_a', 'vitamina': 'vitamin_a',
+    'vitamin_c': 'vitamin_c', 'vitaminc': 'vitamin_c',
+}
 
-model = load_model()
+# Nutrient scoring thresholds: {nutrient: [(threshold, score), ...]}
+SEEK_THRESHOLDS = {
+    'protein': [(30, 30), (25, 25), (20, 20), (15, 15), (10, 10), (5, 5)],
+    'fiber': [(30, 30), (25, 25), (20, 20), (15, 15), (10, 10), (5, 5)],
+    'calcium': [(500, 30), (300, 20), (150, 10)],
+    'iron': [(10, 30), (5, 20), (3, 10)],
+    'vitamin_c': [(50, 30), (25, 20), (10, 10), (5, 5)],
+    'vitamin_a': [(50, 30), (25, 20), (10, 10), (5, 5)],
+}
 
-# Function to detect query intent
-def analyze_query_intent(query):
-    """
-    Detect if user wants to avoid/find low amounts of something or find high amounts
-    Returns: (modified_query, is_avoidance, nutrient_term)
-    """
+AVOID_THRESHOLDS = {
+    'fat': [(30, -25), (20, -20), (15, -15), (10, -10), (5, 15), (8, 10)],
+    'sugar': [(30, -25), (20, -20), (15, -15), (10, -10), (5, 15), (8, 10)],
+    'sodium': [(500, -25), (300, -15), (150, -10), (100, 15)],
+    'cholesterol': [(100, -20), (50, -10), (20, 10)],
+    'iron': [(0.5, 25), (1.0, 20), (2.0, 15), (3.0, 5), (5, -15), (3, -5)],
+    'carbs': [(30, -20), (20, -10), (10, 15)],
+}
+
+SEEK_PATTERNS = [
+    r'high\s+(?:in\s+)?(\w+)(?:\s+but|\s+and|\s+with|,|\s|$)',
+    r'rich\s+in\s+(\w+)(?:\s+but|\s+and|\s+with|,|\s|$)',
+    r'good\s+source\s+of\s+(\w+)(?:\s+but|\s+and|\s+with|,|\s|$)',
+    r'lots\s+of\s+(\w+)(?:\s+but|\s+and|\s+with|,|\s|$)',
+    r'plenty\s+of\s+(\w+)(?:\s+but|\s+and|\s+with|,|\s|$)'
+]
+
+AVOID_PATTERNS = [
+    r'but\s+low\s+(?:in\s+)?(\w+(?:\s+\w+)?)',
+    r'low\s+(?:in\s+)?(\w+(?:\s+\w+)?)',
+    r'avoid\s+(\w+(?:\s+\w+)?)',
+    r'reduce\s+(\w+(?:\s+\w+)?)',
+    r'without\s+(\w+(?:\s+\w+)?)',
+    r'no\s+(\w+(?:\s+\w+)?)'
+]
+
+MEAT_KEYWORDS = [
+    'beef', 'pork', 'chicken', 'turkey', 'lamb', 'veal', 'meat', 
+    'fish', 'seafood', 'bacon', 'ham', 'sausage', 'salami', 'duck',
+    'goose', 'game', 'venison', 'bison', 'steak', 'ribs', 'chop'
+]
+
+DAIRY_KEYWORDS = ['cheese', 'milk', 'egg', 'dairy', 'yogurt', 'butter', 'cream', 'whey']
+
+# ==================== HELPER FUNCTIONS ====================
+
+def normalize_nutrient_name(nutrient):
+    """Normalize captured nutrient names to match data keys"""
+    clean = nutrient.replace(' ', '').replace('_', '').lower()
+    return NUTRIENT_MAPPING.get(clean, None)
+
+
+def apply_threshold_scoring(value, thresholds, ascending=True):
+    """Apply threshold-based scoring logic"""
+    score = 0
+    for threshold, points in thresholds:
+        if ascending:
+            if value > threshold:
+                score = points
+                break
+        else:
+            if value < threshold:
+                score = points
+                break
+    return score
+
+
+def preprocess_query(query):
+    """Extract intent and constraints from query"""
+    intent = {
+        'avoid_nutrients': [],
+        'seek_nutrients': [],
+        'modifiers': [],
+        'original_query': query
+    }
+    
     query_lower = query.lower()
     
-    # Avoidance/negation keywords
-    avoidance_keywords = [
-        'cannot eat', 'can\'t eat', 'should not eat', 'shouldn\'t eat',
-        'avoid', 'low in', 'reduce', 'limit', 'restrict',
-        'without', 'no ', 'less ', 'minimal', 'decrease'
-    ]
+    # Detect avoid and seek patterns
+    for pattern in AVOID_PATTERNS:
+        intent['avoid_nutrients'].extend(re.findall(pattern, query_lower))
     
-    # High/seeking keywords
-    seeking_keywords = [
-        'high in', 'rich in', 'lots of', 'plenty of', 'more ',
-        'increase', 'boost', 'good source', 'need more'
-    ]
+    for pattern in SEEK_PATTERNS:
+        intent['seek_nutrients'].extend(re.findall(pattern, query_lower))
     
-    # Check for avoidance intent
-    is_avoidance = any(keyword in query_lower for keyword in avoidance_keywords)
-    is_seeking = any(keyword in query_lower for keyword in seeking_keywords)
+    # Normalize and deduplicate
+    intent['avoid_nutrients'] = list(set(filter(None, [normalize_nutrient_name(n) for n in intent['avoid_nutrients']])))
+    intent['seek_nutrients'] = list(set(filter(None, [normalize_nutrient_name(n) for n in intent['seek_nutrients']])))
     
-    # Extract nutrient/food term
-    nutrient_patterns = [
-        r'(iron|protein|vitamin|calcium|sodium|sugar|carb|fat|calorie|fiber)',
-        r'(vitamin [a-k]|vitamin b\d+)',
-    ]
+    # Detect modifiers
+    modifiers = ['healthy', 'lean', 'fresh', 'organic', 'natural', 'whole', 'clean']
+    intent['modifiers'] = [mod for mod in modifiers if mod in query_lower]
     
-    nutrient_term = None
-    for pattern in nutrient_patterns:
-        match = re.search(pattern, query_lower)
-        if match:
-            nutrient_term = match.group(1)
-            break
+    return intent
+
+
+def calculate_similarity_percentage(distance):
+    """Convert ChromaDB cosine distance to percentage"""
+    return max(0, min(100, round((1 - (distance / 2)) * 100, 2)))
+
+
+def calculate_nutritional_match(query, nutrients, intent):
+    """Calculate nutritional alignment score based on query intent"""
+    score = 50
     
-    # Create modified query for embedding
-    if is_avoidance and nutrient_term:
-        # Search for LOW nutrient foods
-        modified_query = f"low {nutrient_term} foods"
-        search_mode = "avoidance"
-    elif is_seeking and nutrient_term:
-        # Search for HIGH nutrient foods
-        modified_query = f"high {nutrient_term} foods"
-        search_mode = "seeking"
-    else:
-        # Use original query
-        modified_query = query
-        search_mode = "neutral"
+    # Boost for seek nutrients
+    for nutrient in intent['seek_nutrients']:
+        value = nutrients.get(nutrient, 0)
+        if nutrient in SEEK_THRESHOLDS:
+            for threshold, points in SEEK_THRESHOLDS[nutrient]:
+                if value > threshold:
+                    score += points
+                    break
     
-    return modified_query, search_mode, nutrient_term
+    # Penalty for avoid nutrients
+    for nutrient in intent['avoid_nutrients']:
+        value = nutrients.get(nutrient, 0)
+        if nutrient in AVOID_THRESHOLDS:
+            for threshold, points in AVOID_THRESHOLDS[nutrient]:
+                if nutrient == 'iron':
+                    # Iron avoidance uses different logic
+                    if value < 0.5:
+                        score += 25
+                        break
+                    elif value < 1.0:
+                        score += 20
+                        break
+                    elif value < 2.0:
+                        score += 15
+                        break
+                    elif value < 3.0:
+                        score += 5
+                        break
+                    elif value > 5:
+                        score -= 15
+                        break
+                    elif value > 3:
+                        score -= 5
+                        break
+                else:
+                    if value > threshold:
+                        score += points
+                        break
+                    elif value < threshold and points > 0:
+                        score += points
+                        break
+    
+    # Apply modifiers
+    if 'healthy' in intent['modifiers']:
+        if nutrients.get('fat', 100) < 8 and nutrients.get('sodium', 1000) < 300 and nutrients.get('protein', 0) > 10:
+            score += 25
+        elif nutrients.get('fat', 100) < 12 and nutrients.get('sodium', 1000) < 400:
+            score += 15
+    
+    if 'lean' in intent['modifiers']:
+        if nutrients.get('fat', 100) < 5 and nutrients.get('protein', 0) > 18:
+            score += 25
+        elif nutrients.get('fat', 100) < 8 and nutrients.get('protein', 0) > 12:
+            score += 15
+    
+    return min(100, max(0, score))
 
-# Search interface
-st.subheader("🔍 Search Nutrition Data")
 
-query = st.text_input(
-    "Enter your nutrition question:",
-    placeholder="e.g., high protein foods, I cannot eat high iron food, low calorie snacks"
-)
+def apply_nutritional_filters(results, query, nutrients_data, intent):
+    """Filter results based on nutritional criteria"""
+    filters = {}
+    query_lower = query.lower()
+    exclude_keywords = []
+    
+    # Check for dietary restrictions
+    if any(word in query_lower for word in ['vegetarian', 'vegan', 'plant-based', 'plant based', 'meatless', 'meat-free']):
+        exclude_keywords = MEAT_KEYWORDS.copy()
+        if 'vegan' in query_lower:
+            exclude_keywords.extend(DAIRY_KEYWORDS)
+    
+    # Query-based filters
+    filter_mapping = {
+        'healthy': {'fat': (0, 15), 'sodium': (0, 500)},
+        'lean': {'fat': (0, 8), 'protein': (12, 1000)},
+        'low fat': {'fat': (0, 3)},
+        'lowfat': {'fat': (0, 3)},
+        'low sodium': {'sodium': (0, 140)},
+        'low sugar': {'sugar': (0, 5)},
+        'low calorie': {'calories': (0, 100)},
+    }
+    
+    for keyword, nutrient_filters in filter_mapping.items():
+        if keyword in query_lower:
+            filters.update(nutrient_filters)
+    
+    # Intent-based filters
+    seek_filter_map = {'protein': (20, 1000), 'fiber': (3, 1000), 'calcium': (100, 10000), 'iron': (3, 1000)}
+    avoid_filter_map = {'fat': (0, 10), 'sodium': (0, 300), 'sugar': (0, 8), 'iron': (0, 3), 'cholesterol': (0, 50), 'carbs': (0, 15)}
+    
+    for nutrient in intent['seek_nutrients']:
+        if nutrient in seek_filter_map:
+            filters[nutrient] = seek_filter_map[nutrient]
+    
+    for nutrient in intent['avoid_nutrients']:
+        if nutrient in avoid_filter_map:
+            filters[nutrient] = avoid_filter_map[nutrient]
+    
+    # If no filters, return as-is
+    if not filters and not exclude_keywords:
+        return results
+    
+    # Apply filters
+    filtered = []
+    for result in results:
+        food_id = result.get('id')
+        if not food_id or food_id not in nutrients_data:
+            continue
+        
+        # Check exclusions
+        description = result['metadata'].get('description', '').lower()
+        category = result['metadata'].get('category', '').lower()
+        
+        if any(keyword in description or keyword in category for keyword in exclude_keywords):
+            continue
+        
+        # Check nutrient filters
+        nutrients = nutrients_data[food_id].get('nutrients', {})
+        if all(min_val <= nutrients.get(nutrient, 0) <= max_val for nutrient, (min_val, max_val) in filters.items()):
+            filtered.append(result)
+    
+    return filtered if len(filtered) >= 3 else results[:15]
 
-col1, col2 = st.columns([3, 1])
-with col1:
-    n_results = st.slider("Number of results", min_value=1, max_value=20, value=10)
-with col2:
-    similarity_threshold = st.slider("Relevance threshold", min_value=0.0, max_value=1.0, value=0.3, step=0.1, help="Higher = stricter matching")
 
-# Trigger search on button click OR when slider changes (if previous search exists)
-search_clicked = st.button("Search", type="primary")
+# ==================== MAIN SEARCH FUNCTION ====================
 
-if search_clicked and query:
-    st.session_state.current_query = query
-    st.session_state.current_n_results = n_results
-    st.session_state.search_triggered = True
-elif st.session_state.current_query and n_results != st.session_state.current_n_results:
-    # Slider changed - auto-refresh results
-    st.session_state.current_n_results = n_results
-    st.session_state.search_triggered = True
+def perform_search(query, n_results=10, threshold=0.5):
+    """Main search function with all enhancements"""
+    intent = preprocess_query(query)
+    nutrients_specified = bool(intent['seek_nutrients'] or intent['avoid_nutrients'] or intent['modifiers'])
+    
+    raw_results = collection.query(query_texts=[query], n_results=min(n_results * 3, 50))
+    
+    processed_results = []
+    for i in range(len(raw_results['ids'][0])):
+        food_id = raw_results['ids'][0][i]
+        distance = raw_results['distances'][0][i]
+        metadata = raw_results['metadatas'][0][i]
+        
+        food_data = nutrients_data.get(food_id, {})
+        nutrients = food_data.get('nutrients', {})
+        
+        semantic_score = calculate_similarity_percentage(distance)
+        
+        if nutrients_specified:
+            nutritional_score = calculate_nutritional_match(query, nutrients, intent)
+            combined_score = (semantic_score * 0.4) + (nutritional_score * 0.6)
+        else:
+            nutritional_score = None
+            combined_score = semantic_score
+        
+        processed_results.append({
+            'id': food_id,
+            'distance': distance,
+            'metadata': metadata,
+            'nutrients': nutrients,
+            'semantic_score': semantic_score,
+            'nutritional_score': nutritional_score,
+            'combined_score': combined_score
+        })
+    
+    filtered_results = apply_nutritional_filters(processed_results, query, nutrients_data, intent)
+    filtered_results.sort(key=lambda x: x['combined_score'], reverse=True)
+    final_results = [r for r in filtered_results if r['combined_score'] >= (threshold * 100)]
+    
+    return final_results[:n_results], intent, nutrients_specified
 
-# Perform search if triggered
-if st.session_state.search_triggered and st.session_state.current_query:
-    with st.spinner("🔍 Analyzing your query and searching..."):
-        try:
-            # Analyze query intent
-            modified_query, search_mode, nutrient_term = analyze_query_intent(st.session_state.current_query)
-            
-            # Show intent detection
-            if search_mode == "avoidance":
-                st.info(f"🔍 Detected: You want to **avoid/reduce {nutrient_term}**. Searching for LOW {nutrient_term} foods...")
-            elif search_mode == "seeking":
-                st.info(f"🔍 Detected: You want **high {nutrient_term}**. Searching for foods rich in {nutrient_term}...")
-            
-            # Generate query embedding using modified query
-            query_embedding = model.encode([modified_query])[0].tolist()
-            
-            # Search ChromaDB - get more results than needed for filtering
-            results = collection.query(
-                query_embeddings=[query_embedding],
-                n_results=min(50, st.session_state.current_n_results * 3)
-            )
-            
-            # Extract query keywords for boosting
-            query_words = set(modified_query.lower().split())
-            
-            # Score and filter results
-            scored_results = []
-            for i in range(len(results['metadatas'][0])):
-                metadata = results['metadatas'][0][i]
-                distance = results['distances'][0][i]
+
+# ==================== STREAMLIT UI ====================
+
+st.set_page_config(page_title="Nutrition Advisor", page_icon="🥗", layout="wide")
+
+tab1, tab2 = st.tabs(["🔍 Search", "ℹ️ About"])
+
+with tab1:
+    st.title("🥗 Nutrition Advisor - Semantic Search")
+    st.markdown("Search nutrition data using natural language")
+
+    with st.sidebar:
+        st.header("ℹ️ About")
+        st.write("Semantic search with automatic intent detection for nutrition data.")
+        
+        st.header("💡 Tips")
+        st.write('• Use "high in" or "rich in" for nutrients you want')
+        st.write('• Use "low" or "avoid" for nutrients to minimize')
+        st.write('• Combine requirements: "high protein but low fat"')
+        
+        st.header("Example Queries")
+        st.write('• "high protein foods"')
+        st.write('• "rich in vitamin C but low sugar"')
+        st.write('• "lean healthy meat"')
+        st.write('• "vegetarian high calcium"')
+
+    query = st.text_input("Enter your nutrition question:", placeholder="e.g., high in protein but low in iron")
+
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        n_results = st.slider("Number of results:", 1, 20, 10)
+    with col2:
+        threshold = st.slider("Relevance threshold:", 0.0, 1.0, 0.0, 0.05)
+
+    if st.button("🔍 Search", type="primary"):
+        if query:
+            with st.spinner("Searching..."):
+                results, intent, nutrients_specified = perform_search(query, n_results, threshold)
                 
-                # Check if query words appear in food name or description
-                food_text = f"{metadata['Food']} {metadata['Description']}".lower()
-                keyword_matches = sum(1 for word in query_words if word in food_text)
-                
-                # Additional filtering for avoidance queries
-                if search_mode == "avoidance" and nutrient_term:
-                    # Check if the nutrient appears HIGH in the nutrient data
-                    nutrient_data_lower = metadata['Nutrient Data'].lower()
-                    # If searching for low iron, penalize foods that mention high iron amounts
-                    if nutrient_term in nutrient_data_lower:
-                        # Extract number before nutrient term if possible
-                        pattern = rf'(\d+\.?\d*)\s*(?:mg|g|mcg).*{nutrient_term}'
-                        match = re.search(pattern, nutrient_data_lower)
-                        if match:
-                            amount = float(match.group(1))
-                            # Penalize high amounts when avoiding
-                            if amount > 5:  # Threshold for "high"
-                                distance += 0.3  # Increase distance (lower similarity)
-                
-                # Boost score if keywords match
-                adjusted_distance = distance - (keyword_matches * 0.15)
-                similarity = 1 - distance
-                
-                # Apply similarity threshold
-                if similarity >= similarity_threshold:
-                    scored_results.append({
-                        'metadata': metadata,
-                        'distance': adjusted_distance,
-                        'original_distance': distance,
-                        'similarity': similarity,
-                        'keyword_matches': keyword_matches
-                    })
-            
-            # Sort by adjusted distance (lower is better)
-            scored_results.sort(key=lambda x: x['distance'])
-            
-            # Take top n_results
-            final_results = scored_results[:st.session_state.current_n_results]
-            
-            # Store for AI enhancement
-            st.session_state.last_results = [r['metadata'] for r in final_results]
-            
-            # Display results
-            if final_results:
-                st.success(f"✅ Found {len(final_results)} relevant results!")
-                
-                st.markdown("### 📊 Search Results")
-                
-                for i, result in enumerate(final_results):
-                    metadata = result['metadata']
-                    similarity = result['similarity']
-                    keyword_matches = result['keyword_matches']
+                # Display detected intent
+                if intent['seek_nutrients'] or intent['avoid_nutrients'] or intent['modifiers']:
+                    st.markdown("---")
+                    st.subheader("🎯 Detected Intent:")
                     
-                    # Create title with match indicator
-                    match_emoji = "🎯" if keyword_matches > 0 else "📍"
-                    title = f"{match_emoji} **{i+1}. {metadata['Food']}** (Match: {similarity:.1%})"
+                    col1, col2, col3 = st.columns(3)
                     
-                    with st.expander(title, expanded=(i==0)):
-                        col1, col2 = st.columns([1, 2])
-                        
-                        with col1:
-                            st.markdown("**Category:**")
-                            st.write(metadata['Category'])
-                        
-                        with col2:
-                            st.markdown("**Description:**")
-                            st.write(metadata['Description'])
-                        
-                        st.markdown("**Nutrient Data:**")
-                        st.write(metadata['Nutrient Data'])
-                        
-                        # Show match details
-                        if keyword_matches > 0:
-                            st.caption(f"🎯 {keyword_matches} keyword match(es)")
-            else:
-                st.warning(f"⚠️ No results found with similarity ≥ {similarity_threshold:.0%}. Try lowering the relevance threshold or using different keywords.")
+                    if intent['seek_nutrients']:
+                        col1.success(f"**WANT HIGH:** {', '.join(intent['seek_nutrients'])}")
+                    if intent['avoid_nutrients']:
+                        col2.warning(f"**AVOID/LOW:** {', '.join(intent['avoid_nutrients'])}")
+                    if intent['modifiers']:
+                        col3.info(f"**Modifiers:** {', '.join(intent['modifiers'])}")
                 
-        except Exception as e:
-            st.error(f"❌ Search error: {str(e)}")
-            import traceback
-            st.code(traceback.format_exc())
-elif search_clicked and not query:
-    st.warning("⚠️ Please enter a search query")
+                # Display scoring method
+                st.markdown("---")
+                if nutrients_specified:
+                    st.info("📊 **Scoring**: 40% semantic + 60% nutritional match")
+                else:
+                    st.info("📊 **Scoring**: 100% semantic similarity")
+                
+                st.markdown("---")
+                if results:
+                    st.success(f"✅ Found {len(results)} results")
+                    st.subheader("📊 Search Results")
+                    
+                    for i, result in enumerate(results):
+                        with st.expander(f"**{i+1}. {result['metadata'].get('description', 'Unknown')}**", expanded=(i<3)):
+                            col1, col2, col3 = st.columns(3)
+                            col1.metric("Semantic Match", f"{result['semantic_score']:.1f}%")
+                            
+                            if result['nutritional_score'] is not None:
+                                col2.metric("Nutritional Match", f"{result['nutritional_score']:.1f}%")
+                            else:
+                                col2.metric("Nutritional Match", "N/A")
+                            
+                            col3.metric("Combined Score", f"{result['combined_score']:.1f}%")
+                            
+                            st.markdown(f"**Category:** {result['metadata'].get('category', 'Unknown')}")
+                            
+                            nutrients = result['nutrients']
+                            if nutrients:
+                                st.markdown("**Nutrients:**")
+                                nutrient_text = ", ".join([f"{k}: {v}{'kcal' if k == 'calories' else 'g'}" 
+                                                          for k, v in nutrients.items()])
+                                st.text(nutrient_text)
+                            
+                            # Highlight matches
+                            if intent['seek_nutrients'] or intent['avoid_nutrients']:
+                                matches = []
+                                for nutrient in intent['seek_nutrients']:
+                                    if nutrient in nutrients and nutrients[nutrient] > 15:
+                                        matches.append(f"✅ High {nutrient}: {nutrients[nutrient]}g")
+                                for nutrient in intent['avoid_nutrients']:
+                                    if nutrient in nutrients and nutrients[nutrient] < 5:
+                                        matches.append(f"✅ Low {nutrient}: {nutrients[nutrient]}g")
+                                
+                                if matches:
+                                    st.success(" | ".join(matches))
+                else:
+                    st.warning("No results found. Try adjusting threshold or query.")
+        else:
+            st.error("Please enter a search query")
 
-# Sidebar info
-with st.sidebar:
-    st.header("ℹ️ About")
+with tab2:
+    st.title("ℹ️ About This App")
+    
+    st.header("📚 Data Source")
     st.write("""
-    This app uses semantic search with intent detection to find relevant nutrition information.
+    **USDA FoodData Central** - FNDDS Survey Foods (October 2024)
     
-    **How it works:**
-    1. Enter a natural language query
-    2. The app detects if you want high/low nutrients
-    3. Searches and ranks results accordingly
-    
-    **Powered by:**
-    - Sentence Transformers
-    - ChromaDB
+    - ~5,400 foods commonly consumed in the US
+    - Filtered for quality (removed baby foods, supplements, incomplete data)
+    - 12 key nutrients tracked per food
+    - [Download source](https://fdc.nal.usda.gov/download-datasets.html)
     """)
     
-    st.header("💡 Tips")
-    st.markdown("""
-    - 🎯 = Exact keyword match
-    - 📍 = Semantic match
-    - Say "cannot eat" or "avoid" for low amounts
-    - Say "high in" or "rich in" for high amounts
-    - The app detects your intent automatically
+    st.header("🔧 How It Works")
+    st.write("""
+    **1. Intent Detection**: Automatically understands what you want
+    - Detects "high in", "low", "avoid" patterns
+    - Identifies modifiers like "healthy", "lean"
+    - Recognizes dietary restrictions (vegetarian, vegan)
+    
+    **2. Semantic Search**: Uses AI to understand meaning, not just keywords
+    - Converts your query to a vector embedding
+    - Searches 5,400+ foods in ChromaDB vector database
+    - Model: `all-MiniLM-L6-v2`
+    
+    **3. Adaptive Scoring**:
+    - **No nutrient requirements**: 100% semantic similarity
+    - **With nutrient requirements**: 40% semantic + 60% nutritional match
+    
+    **4. Smart Filtering**: Applies filters based on detected intent
+    - Nutrient thresholds (high/low values)
+    - Dietary restrictions (excludes meat/dairy)
+    - Health modifiers ("healthy", "lean")
     """)
     
-    st.header("📝 Example Queries")
-    st.markdown("""
-    **Avoidance:**
-    - "I cannot eat high iron food"
-    - "foods low in sodium"
-    - "avoid sugar"
+    st.header("💡 Usage Tips")
+    st.write("""
+    **Express what you want:**
+    - "high protein foods", "rich in calcium"
     
-    **Seeking:**
-    - "high protein foods"
-    - "rich in vitamin C"
-    - "good source of calcium"
+    **Express what to avoid:**
+    - "low fat", "avoid sugar", "no iron"
+    
+    **Combine requirements:**
+    - "high protein but low fat"
+    - "healthy breakfast with fiber"
+    
+    **Use modifiers:**
+    - healthy, lean, fresh, vegetarian, vegan
+    
+    **Adjust search parameters:**
+    - Number of results (1-20)
+    - Relevance threshold (0-1.0)
     """)
+    
+    st.header("🛠️ Tech Stack")
+    st.write("""
+    - **UI**: Streamlit
+    - **Embeddings**: Sentence-Transformers (all-MiniLM-L6-v2)
+    - **Vector DB**: ChromaDB
+    - **Data**: USDA FoodData Central (Oct 2024)
+    - **Intent Detection**: Regex pattern matching
+    """)
+    
+    st.markdown("---")
+    st.markdown("*Data last updated: October 2024*")
